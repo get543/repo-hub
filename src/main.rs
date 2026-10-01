@@ -5,11 +5,15 @@ mod scan;
 mod ui;
 
 use std::io;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use app::{App, AppMode};
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
+        KeyModifiers, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -64,6 +68,75 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
+/// Widget areas captured from the most recent render (for mouse hit-testing).
+static LAST_AREAS: Mutex<Option<ui::UiAreas>> = Mutex::new(None);
+/// Last list-row click, for double-click detection.
+static LAST_CLICK: Mutex<Option<(usize, Instant)>> = Mutex::new(None);
+
+fn last_areas() -> ui::UiAreas {
+    LAST_AREAS.lock().map(|g| *g).unwrap_or(None).unwrap_or_default()
+}
+
+fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
+    let areas = last_areas();
+
+    // Wheel scrolling moves the selection through the repo list.
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            app.move_list(-3);
+            app.dirty = true;
+            return;
+        }
+        MouseEventKind::ScrollDown => {
+            app.move_list(3);
+            app.dirty = true;
+            return;
+        }
+        _ => {}
+    }
+
+    if !matches!(mouse.kind, MouseEventKind::Down(crossterm::event::MouseButton::Left)) {
+        return;
+    }
+
+    // 1. Drive tabs along the top.
+    if areas.tabs.contains(ratatui::layout::Position { x: mouse.column, y: mouse.row }) {
+        let titles = ui::tab_titles(app);
+        if let Some(tab) = ui::tab_index_at(areas.tabs, &titles, mouse.column) {
+            app.set_drive_tab(tab);
+            return;
+        }
+    }
+
+    // 2. Repo list rows: single click selects, double click opens a shell there.
+    if let Some(row) = ui::list_row_at(areas.list, mouse.column, mouse.row) {
+        let now = Instant::now();
+        let is_double = LAST_CLICK
+            .lock()
+            .map(|g| g.map(|(r, t)| r == row && now.duration_since(t) < Duration::from_millis(400)).unwrap_or(false))
+            .unwrap_or(false);
+        if let Ok(mut g) = LAST_CLICK.lock() {
+            *g = if is_double { None } else { Some((row, now)) };
+        }
+        if is_double {
+            app.double_click_list_row(row);
+        } else {
+            app.click_list_row(row);
+        }
+        return;
+    }
+
+    // 3. Click anywhere else dismisses overlays / result popups.
+    if app.mode == AppMode::Message || app.help {
+        app.mode = AppMode::Normal;
+        app.help = false;
+        app.dirty = true;
+    } else if app.mode == AppMode::Prompt || app.mode == AppMode::Search {
+        app.mode = AppMode::Normal;
+        app.dirty = true;
+    }
+}
+
 fn run<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
@@ -77,16 +150,26 @@ fn run<B: ratatui::backend::Backend>(
 
         // Only redraw when something changed or the tick elapsed -> keeps CPU low.
         if app.dirty || last_render.elapsed() >= tick_rate {
+            let size: ratatui::layout::Rect = terminal.get_frame().area();
+            let areas = ui::draw_areas(size, app);
+            if let Ok(mut g) = LAST_AREAS.lock() {
+                *g = Some(areas);
+            }
             terminal.draw(|f| ui::draw(f, app))?;
             app.dirty = false;
             last_render = Instant::now();
         }
 
         if event::poll(Duration::from_millis(20))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    handle_key(app, key);
+            match event::read()? {
+                Event::Key(key) => {
+                    if key.kind == KeyEventKind::Press {
+                        handle_key(app, key);
+                    }
                 }
+                Event::Mouse(m) => handle_mouse(app, m),
+                Event::Resize(_, _) => app.dirty = true,
+                _ => {}
             }
         }
 
