@@ -1,1 +1,13 @@
-(empty)
+/target/
+
+# IDE files
+.vscode/
+.idea/
+
+# Python test artifacts
+__pycache__/
+*.py[cod]
+
+# OS files
+.DS_Store
+Thumbs.db
