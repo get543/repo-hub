@@ -336,6 +336,35 @@ impl App {
         }
     }
 
+    /// Mouse click on a list row: `row` is 0-based within the visible viewport.
+    pub fn click_list_row(&mut self, row: usize) {
+        let target = self.list_offset + row;
+        if target < self.filtered.len() {
+            self.select(target);
+        }
+    }
+
+    /// Double-click a list row: select it and open a shell in that folder.
+    pub fn double_click_list_row(&mut self, row: usize) {
+        let target = self.list_offset + row;
+        if target < self.filtered.len() {
+            self.select(target);
+            self.open_terminal();
+        }
+    }
+
+    pub fn set_drive_tab(&mut self, tab: usize) {
+        self.active_drive = if tab == 0 { None } else { Some(tab - 1) };
+        if self.drives.is_empty() && self.active_drive.is_some() {
+            self.active_drive = None;
+        }
+        self.apply_filter();
+        self.selected = 0;
+        self.list_offset = 0;
+        self.refresh_selected_now();
+        self.dirty = true;
+    }
+
     pub fn cycle_drive(&mut self, dir: i32) {
         let n = self.drives.len() as i32;
         if n == 0 {

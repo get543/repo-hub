@@ -1,16 +1,1 @@
-# Rust build artifacts
-target/
-
-# Editor and IDE files
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# System files
-.DS_Store
-Thumbs.dbnode_modules/
-.next/
-dist/
-build/
-*.log
+(empty)

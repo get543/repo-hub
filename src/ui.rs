@@ -11,23 +11,102 @@ use ratatui::{
 use crate::app::{App, AppMode};
 use crate::git;
 
-pub fn draw(f: &mut Frame, app: &mut App) {
-    let size = f.area();
+/// Widget regions from the last render, used for mouse hit-testing.
+#[derive(Default, Clone, Copy)]
+pub struct UiAreas {
+    pub tabs: Rect,
+    pub list: Rect,
+    pub detail: Rect,
+}
 
-    let chunks = Layout::default()
+pub fn layout(size: Rect) -> [Rect; 5] {
+    Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // tabs
             Constraint::Min(8),    // main panes
             Constraint::Length(2), // status line
+            Constraint::Length(1), // glyph legend
             Constraint::Length(1), // key hints
         ])
-        .split(size);
+        .split(size)
+        .to_vec()
+        .try_into()
+        .unwrap()
+}
+
+pub fn main_panes(area: Rect) -> [Rect; 2] {
+    let right_width = if area.width > 110 { 46 } else { 40 };
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Fill(1), Constraint::Length(right_width)])
+        .split(area)
+        .to_vec()
+        .try_into()
+        .unwrap()
+}
+
+/// Accurate version: needs the tab titles, so pass them in.
+pub fn tab_index_at(tabs: Rect, titles: &[String], col: u16) -> Option<usize> {
+    if tabs.width == 0 || col < tabs.x + 1 || col >= tabs.x + tabs.width.saturating_sub(1) {
+        return None;
+    }
+    // row inside the border box (any row counts, we only care about column)
+    let mut x = tabs.x + 1;
+    for (i, t) in titles.iter().enumerate() {
+        let w = t.chars().count() as u16;
+        if col < x + w {
+            return Some(i);
+        }
+        x += w + 1; // separator
+        if x > tabs.x + tabs.width {
+            break;
+        }
+    }
+    None
+}
+
+/// Row index within the visible list viewport for a given screen position.
+pub fn list_row_at(list: Rect, col: u16, row: u16) -> Option<usize> {
+    if list.height <= 2 || list.width == 0 {
+        return None;
+    }
+    let inner_x = list.x + 1;
+    let inner_y = list.y + 1;
+    let inner_w = list.width.saturating_sub(2);
+    let inner_h = list.height.saturating_sub(2);
+    if col < inner_x || col >= inner_x + inner_w {
+        return None;
+    }
+    if row < inner_y || row >= inner_y + inner_h {
+        return None;
+    }
+    // Each repo occupies two visual rows.
+    Some(((row - inner_y) / 2) as usize)
+}
+
+/// Compute the widget areas for a given terminal size (used for mouse hit-testing).
+pub fn draw_areas(size: Rect, _app: &App) -> UiAreas {
+    let chunks = layout(size);
+    let panes = main_panes(chunks[1]);
+    UiAreas {
+        tabs: chunks[0],
+        list: panes[0],
+        detail: panes[1],
+    }
+}
+
+pub fn draw(f: &mut Frame, app: &mut App) {
+    let size = f.area();
+    let chunks = layout(size);
+    let panes = main_panes(chunks[1]);
 
     draw_tabs(f, app, chunks[0]);
-    draw_main(f, app, chunks[1]);
+    draw_list(f, app, panes[0]);
+    draw_detail(f, app, panes[1]);
     draw_status(f, app, chunks[2]);
-    draw_hints(f, app, chunks[3]);
+    draw_legend(f, chunks[3]);
+    draw_hints(f, app, chunks[4]);
 
     if app.help {
         draw_help(f, size);
@@ -40,14 +119,16 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 }
 
-fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
-    let mut titles: Vec<String> = vec![format!(
-        " All ({}) ",
-        app.repos.len()
-    )];
+pub fn tab_titles(app: &App) -> Vec<String> {
+    let mut titles: Vec<String> = vec![format!(" All ({}) ", app.repos.len())];
     for d in &app.drives {
         titles.push(format!(" {} ({}) ", d.label, d.count));
     }
+    titles
+}
+
+fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
+    let titles = tab_titles(app);
     let selected = app.active_drive.map(|i| i + 1).unwrap_or(0);
 
     let tabs = Tabs::new(titles)
@@ -60,20 +141,6 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
         );
     f.render_widget(tabs, area);
-}
-
-fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
-    let right_width = if area.width > 110 { 46 } else { 40 };
-    let panes = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Fill(1),
-            Constraint::Length(right_width),
-        ])
-        .split(area);
-
-    draw_list(f, app, panes[0]);
-    draw_detail(f, app, panes[1]);
 }
 
 fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
@@ -398,12 +465,43 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+/// One-line legend explaining every status glyph & badge the list can show.
+fn draw_legend(f: &mut Frame, area: Rect) {
+    let spans = vec![
+        Span::raw(" "),
+        Span::styled("●", Style::default().fg(Color::Red)),
+        Span::raw(" uncommitted changes  "),
+        Span::styled("▲", Style::default().fg(Color::Blue)),
+        Span::raw(" ahead → push needed  "),
+        Span::styled("▼", Style::default().fg(Color::Magenta)),
+        Span::raw(" behind → pull needed  "),
+        Span::styled("⚡", Style::default().fg(Color::LightRed)),
+        Span::raw(" merge conflict  "),
+        Span::styled("○", Style::default().fg(Color::Green)),
+        Span::raw(" clean  "),
+        Span::styled("⋯", Style::default().fg(Color::Yellow)),
+        Span::raw(" reading…  "),
+        Span::styled("+n", Style::default().fg(Color::LightYellow)),
+        Span::raw(" staged  "),
+        Span::styled("~n", Style::default().fg(Color::LightYellow)),
+        Span::raw(" modified  "),
+        Span::styled("?n", Style::default().fg(Color::LightYellow)),
+        Span::raw(" untracked  "),
+        Span::styled("[STALE]", Style::default().fg(Color::DarkGray)),
+        Span::raw(" no commit in 6 months"),
+    ];
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().fg(Color::DarkGray)),
+        area,
+    );
+}
+
 fn draw_hints(f: &mut Frame, app: &App, area: Rect) {
     let txt = match app.mode {
-        AppMode::Normal => " j/↓ k/↑ move · Tab drive · / search · a stage · c commit · p push · P force-push · l pull · f fetch · F fetch-all · n dirty-filter · t terminal · g lazygit · v code · x clean · e export · r rescan · ? help · q quit ",
-        AppMode::Search => " type to filter repos · Enter apply · Esc clear ",
-        AppMode::Prompt => " Enter commit · Esc cancel ",
-        AppMode::Message => " press any key to dismiss ",
+        AppMode::Normal => " 🖱 click=select · dbl-click=shell · wheel=scroll · Tab=drive  |  ⌨ j/k move · / search · a stage · c commit · p push · f fetch · F fetch-all · n dirty-only · t/g/v tools · x clean · ? help · q quit ",
+        AppMode::Search => " 🔎 type to filter repos · Enter apply · Esc clear ",
+        AppMode::Prompt => " ✏️  Enter = run commit · Esc = cancel ",
+        AppMode::Message => " press any key / click to dismiss ",
     };
     f.render_widget(
         Paragraph::new(txt).style(
@@ -476,36 +574,70 @@ fn draw_message(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
+    fn section(title: &str, color: Color) -> Row<'static> {
+        Row::new(vec![
+            Span::styled(
+                title.to_string(),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(""),
+        ])
+    }
+    fn kv(k: &str, v: &str) -> Row<'static> {
+        Row::new(vec![
+            Span::styled(
+                k.to_string(),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(v.to_string(), Style::default().fg(Color::Gray)),
+        ])
+    }
+
     let rows = vec![
-        Row::new(vec!["j / k / ↑ / ↓", "move through the repository list"]),
-        Row::new(vec!["Tab / Shift-Tab", "switch drive (All → C:\\ → D:\\ …)"]),
-        Row::new(vec!["/", "live fuzzy-ish search over names & paths"]),
-        Row::new(vec!["n", "end-of-day audit: show only dirty / unpushed repos"]),
-        Row::new(vec!["a", "stage everything (git add -A semantics)"]),
-        Row::new(vec!["u", "unstage everything (reset index to HEAD)"]),
-        Row::new(vec!["c", "commit staged changes (prompts for message)"]),
-        Row::new(vec!["p / P", "push / push --force-with-lease to origin"]),
-        Row::new(vec!["l", "pull --ff-only"]),
-        Row::new(vec!["f / F", "fetch this repo / fetch ALL repos"]),
-        Row::new(vec!["t", "open a shell inside the repo folder"]),
-        Row::new(vec!["g", "open lazygit on the repo"]),
-        Row::new(vec!["v", "open VS Code on the repo"]),
-        Row::new(vec!["x", "delete target/node_modules/dist/build (disk space)"]),
-        Row::new(vec!["e", "export a TSV report of every repo"]),
-        Row::new(vec!["r", "rescan all drives from scratch"]),
-        Row::new(vec!["?", "toggle this help"]),
-        Row::new(vec!["q / Ctrl-C", "quit"]),
+        section("🖱  Mouse", Color::Green),
+        kv("click a row", "select that repository (detail pane updates instantly)"),
+        kv("double-click a row", "open a shell inside that repo — type `exit` to return"),
+        kv("scroll wheel", "move through the repo list (3 rows per notch)"),
+        kv("click a drive tab", "filter the list to that drive, or \"All\""),
+        kv("click outside popup", "dismiss help / result / search / prompt"),
+        section("⌨  Keys", Color::Cyan),
+        kv("j / k / ↑ / ↓", "move selection through the repository list"),
+        kv("Tab / Shift-Tab", "cycle drive tabs (All → drive1 → drive2 …)"),
+        kv("/", "live search over repo names & full paths (Enter keeps, Esc clears)"),
+        kv("Enter", "re-read the selected repo's git status right now"),
+        kv("n", "end-of-day audit: show only dirty / unpushed repos"),
+        kv("a  ·  u", "stage everything (git add -A)  ·  unstage everything"),
+        kv("c", "commit staged changes (prompts for a message; Enter runs it)"),
+        kv("p / P", "push  ·  push --force-with-lease (use sparingly!)"),
+        kv("l", "pull --ff-only"),
+        kv("f / F", "fetch this repo  ·  fetch ALL repos in the background"),
+        kv("t / g / v", "open shell / lazygit / VS Code at the repo"),
+        kv("x", "delete target/node_modules/dist/build to reclaim disk space"),
+        kv("e", "export a TSV report of every repo to the temp folder"),
+        kv("r", "rescan all drives from scratch (clears the cache)"),
+        kv("?  ·  q", "toggle this help  ·  quit (Ctrl-C also works)"),
+        section("◉  Status glyphs & badges", Color::Yellow),
+        kv("● red", "dirty — staged/modified/untracked files not committed"),
+        kv("▲ blue", "ahead — local commits not yet pushed to the remote"),
+        kv("▼ magenta", "behind — remote has commits you haven't pulled"),
+        kv("⚡ bright-red", "conflicted files — resolve before committing"),
+        kv("○ green", "clean and in sync with its remote"),
+        kv("⋯ yellow", "repo info still being read in the background"),
+        kv("+n / ~n / ?n", "staged / modified / untracked file counts"),
+        kv("↑n / ↓n", "commits ahead of / behind the upstream branch"),
+        kv("[STALE]", "no commit for 6+ months — candidate for `x` cleanup"),
     ];
-    let widths = [Constraint::Length(16), Constraint::Fill(1)];
+
+    let widths = [Constraint::Length(20), Constraint::Fill(1)];
     let table = Table::new(rows, widths)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" repo-hub keys ")
+                .title(" repo-hub — mouse, keys & symbols ")
                 .border_style(Style::default().fg(Color::Cyan)),
         )
         .column_spacing(2);
-    let popup = centered_rect(70, 1, 20, area);
+    let popup = centered_rect(80, 1, 34, area);
     f.render_widget(Clear, popup);
     f.render_widget(table, popup);
 }
