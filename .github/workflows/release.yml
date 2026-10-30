@@ -81,9 +81,6 @@ jobs:
           - name: Linux x86_64
             os: ubuntu-latest
             platform: linux
-          - name: macOS arm64
-            os: macos-14
-            platform: macos
 
     runs-on: ${{ matrix.os }}
 
@@ -142,35 +139,6 @@ jobs:
             --appdir AppDir \
             --output appimage
           mv ./*-x86_64.AppImage release/repo-hub-linux-x86_64.AppImage
-
-      - name: Package macOS application
-        if: matrix.platform == 'macos'
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p release/repo-hub.app/Contents/MacOS
-          cp target/release/repo-hub release/repo-hub.app/Contents/MacOS/repo-hub
-          chmod +x release/repo-hub.app/Contents/MacOS/repo-hub
-          cat > release/repo-hub.app/Contents/Info.plist <<'EOF'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>CFBundleExecutable</key>
-            <string>repo-hub</string>
-            <key>CFBundleIdentifier</key>
-            <string>com.repo-hub.app</string>
-            <key>CFBundleName</key>
-            <string>Repo Hub</string>
-            <key>CFBundlePackageType</key>
-            <string>APPL</string>
-          </dict>
-          </plist>
-          EOF
-          ditto -c -k --sequesterRsrc --keepParent \
-            release/repo-hub.app release/repo-hub-macos-arm64.zip
-          hdiutil create -volname RepoHub -srcfolder release/repo-hub.app \
-            -ov -format UDZO release/repo-hub-macos-arm64.dmg
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
