@@ -114,13 +114,16 @@ When repo-hub starts, it begins scanning immediately. Repositories appear in the
 | `Home` / `End` | Move to the first or last repository |
 | `Tab` / `Shift-Tab` | Cycle through **All** and the drive tabs |
 | `/` | Search repository names and full paths as you type |
-| `Enter` | Refresh the selected repository's Git status |
+| `Enter` | Choose an editor for the selected repository |
+| `Right Arrow` | Browse the selected repository, or open a selected folder |
+| `Left Arrow` / `Escape` | Go back one directory level; Escape dismisses prompts |
+| `Ctrl` + `Left` / `Right` | Grow / shrink the detail pane |
 | `n` | Toggle the dirty/unpushed-only filter |
 | `r` | Clear the cache and rescan all roots from scratch |
 | `?` or `H` | Open the built-in help screen |
 | `q` or `Ctrl-C` | Quit |
 
-Mouse input is also supported. Click a row to select it, double-click a row to open a shell in that repository, use the wheel to scroll, or click a drive tab to filter by drive.
+Mouse input is also supported. Drag the divider between the repository list and detail pane to resize them. Click a repository row to browse its files and folders; click a folder to open it, or click a file to open it with your operating system's default application. In the browser, select a file and press `Enter` to open it as well. Use the wheel to scroll or click a drive tab to filter by drive. The browser includes hidden files but omits Git's internal `.git` directory.
 
 ### Git operations
 
@@ -146,6 +149,7 @@ The application refreshes the selected repository after an operation and display
 | `t` | Open the system shell in the selected repository |
 | `g` | Open lazygit in the selected repository |
 | `v` | Open VS Code or VSCodium in the selected repository |
+| `Enter` on a repository | Choose VS Code/VSCodium or the operating system's default app |
 | `e` | Write a TSV report to the system temporary directory |
 | `x` | Delete `target`, `node_modules`, `dist`, and `build` in the selected repository |
 

@@ -437,24 +437,73 @@ pub fn which(cmd: &str) -> Option<PathBuf> {
     }
     #[cfg(windows)]
     {
-        if Command::new(cmd).arg("--version").output().is_ok() {
-            return Some(PathBuf::from(cmd));
-        }
-        None
+        let path = std::env::var_os("PATH")?;
+        let path_ext = std::env::var_os("PATHEXT").unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
+        find_windows_command(cmd, &path, &path_ext)
     }
 }
 
-/// List all local branches (shown in the detail pane).
-pub fn branches(path: &Path) -> Vec<String> {
-    Repository::open(path)
-        .map(|repo| {
-            repo.branches(Some(BranchType::Local))
-                .map(|iter| {
-                    iter.filter_map(|res| res.ok())
-                        .filter_map(|(br, _)| br.name().ok().flatten().map(|n| n.to_string()))
-                        .collect()
-                })
-                .unwrap_or_default()
+#[cfg(windows)]
+fn find_windows_command(
+    cmd: &str,
+    path: &std::ffi::OsStr,
+    path_ext: &std::ffi::OsStr,
+) -> Option<PathBuf> {
+    let command = Path::new(cmd);
+    if command.components().count() > 1 {
+        return command.is_file().then(|| command.to_path_buf());
+    }
+
+    let extensions: Vec<String> = if command.extension().is_some() {
+        vec![String::new()]
+    } else {
+        path_ext
+            .to_string_lossy()
+            .split(';')
+            .map(str::to_string)
+            .collect()
+    };
+
+    std::env::split_paths(path).find_map(|directory| {
+        extensions.iter().find_map(|extension| {
+            let mut candidate = directory.join(cmd);
+            if !extension.is_empty() {
+                candidate.set_extension(extension.trim_start_matches('.'));
+            }
+            candidate.is_file().then_some(candidate)
         })
-        .unwrap_or_default()
+    })
+}
+
+#[cfg(all(test, windows))]
+mod windows_command_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn finds_command_shims_using_pathext() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("repo-hub-command-{unique}"));
+        std::fs::create_dir_all(&directory).unwrap();
+        let shim = directory.join("code.cmd");
+        std::fs::write(&shim, "@echo off").unwrap();
+
+        let search_path = std::env::join_paths([&directory]).unwrap();
+        let found = find_windows_command(
+            "code",
+            search_path.as_os_str(),
+            std::ffi::OsStr::new(".COM;.EXE;.CMD"),
+        );
+        assert!(found.as_ref().is_some_and(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("code.cmd"))
+        }));
+
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

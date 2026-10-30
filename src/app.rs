@@ -1,6 +1,7 @@
 //! Application state, event plumbing and all user-facing actions.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Instant;
 
@@ -20,6 +21,11 @@ pub enum AppEvent {
     OpResult { op: String, msg: String },
     /// One repo finished fetching during a global "fetch all".
     FetchProgress { done: usize, total: usize },
+    /// A selected repository folder finished deleting.
+    DeleteResult {
+        path: PathBuf,
+        result: Result<(), String>,
+    },
 }
 
 #[derive(PartialEq, Eq)]
@@ -27,6 +33,9 @@ pub enum AppMode {
     Normal,
     Search,
     Prompt,
+    EditorPrompt,
+    ConfirmDelete,
+    Deleting,
     Message,
 }
 
@@ -40,9 +49,26 @@ pub struct RepoEntry {
 }
 
 pub struct DriveTab {
-    pub root: PathBuf,
     pub label: String,
     pub count: usize,
+}
+
+#[derive(Clone)]
+pub struct DirectoryEntry {
+    pub path: PathBuf,
+    pub name: String,
+    pub is_dir: bool,
+}
+
+pub struct DirectoryLevel {
+    pub path: PathBuf,
+    pub entries: Vec<DirectoryEntry>,
+    pub selected: usize,
+    pub offset: usize,
+}
+
+pub struct DirectoryBrowser {
+    pub levels: Vec<DirectoryLevel>,
 }
 
 pub struct App {
@@ -56,6 +82,9 @@ pub struct App {
     pub filtered: Vec<usize>, // indices into `repos`
     pub selected: usize,      // index into `filtered`
     pub list_offset: usize,   // scroll offset
+    pub browser: Option<DirectoryBrowser>,
+    pub detail_width: Option<u16>,
+    pub dragging_divider: bool,
 
     pub search_query: String,
     pub dirty_only: bool,
@@ -73,8 +102,11 @@ pub struct App {
 
     pub prompt_title: String,
     pub prompt_value: String,
+    pub pending_editor: Option<PathBuf>,
+    pub pending_delete: Option<PathBuf>,
 
     pub fetch_progress: Option<(usize, usize)>,
+    terminal_needs_clear: bool,
     use_cache: bool,
     roots: Vec<PathBuf>,
 }
@@ -85,7 +117,6 @@ impl App {
         let drives: Vec<DriveTab> = roots
             .iter()
             .map(|r| DriveTab {
-                root: r.clone(),
                 label: drive_label(r),
                 count: 0,
             })
@@ -102,6 +133,9 @@ impl App {
             filtered: Vec::new(),
             selected: 0,
             list_offset: 0,
+            browser: None,
+            detail_width: None,
+            dragging_divider: false,
             search_query: String::new(),
             dirty_only: false,
             scanner: None,
@@ -114,7 +148,10 @@ impl App {
             help: false,
             prompt_title: String::new(),
             prompt_value: String::new(),
+            pending_editor: None,
+            pending_delete: None,
             fetch_progress: None,
+            terminal_needs_clear: false,
             use_cache,
             roots,
         };
@@ -207,8 +244,10 @@ impl App {
             .unwrap_or(0);
         if !events.is_empty() {
             for ev in events {
-                let idx = self.push_repo(ev.path, ev.drive);
-                self.spawn_info(idx);
+                if ev.path.exists() {
+                    let idx = self.push_repo(ev.path, ev.drive);
+                    self.spawn_info(idx);
+                }
             }
             self.apply_filter();
             got_something = true;
@@ -250,6 +289,34 @@ impl App {
                 AppEvent::FetchProgress { done, total } => {
                     self.fetch_progress = Some((done, total));
                     self.status_line = format!("fetching all repos… {done}/{total}");
+                    got_something = true;
+                }
+                AppEvent::DeleteResult { path, result } => {
+                    match result {
+                        Ok(()) => {
+                            if let Some(idx) = self.repos.iter().position(|repo| repo.path == path)
+                            {
+                                let drive = self.repos[idx].drive;
+                                self.repos.remove(idx);
+                                if let Some(tab) = self.drives.get_mut(drive) {
+                                    tab.count = tab.count.saturating_sub(1);
+                                }
+                            }
+                            self.apply_filter();
+                            self.list_offset = self.list_offset.min(self.selected);
+                            self.save_cache();
+                            self.refresh_selected_now();
+                            self.message = format!("deleted repository folder {}", path.display());
+                        }
+                        Err(error) => {
+                            if let Some(repo) = self.repos.iter_mut().find(|repo| repo.path == path)
+                            {
+                                repo.busy = false;
+                            }
+                            self.message = format!("could not delete {}: {error}", path.display());
+                        }
+                    }
+                    self.mode = AppMode::Message;
                     got_something = true;
                 }
             }
@@ -295,6 +362,20 @@ impl App {
     // ------------------------------------------------------------------
 
     pub fn move_list(&mut self, delta: i32) {
+        if let Some(level) = self
+            .browser
+            .as_mut()
+            .and_then(|browser| browser.levels.last_mut())
+        {
+            if level.entries.is_empty() {
+                return;
+            }
+            let selected = (level.selected as i64 + i64::from(delta))
+                .clamp(0, level.entries.len() as i64 - 1) as usize;
+            level.selected = selected;
+            self.dirty = true;
+            return;
+        }
         if self.filtered.is_empty() {
             return;
         }
@@ -313,6 +394,18 @@ impl App {
     }
 
     pub fn select(&mut self, i: usize) {
+        if let Some(level) = self
+            .browser
+            .as_mut()
+            .and_then(|browser| browser.levels.last_mut())
+        {
+            if level.entries.is_empty() {
+                return;
+            }
+            level.selected = i.min(level.entries.len() - 1);
+            self.dirty = true;
+            return;
+        }
         if self.filtered.is_empty() {
             return;
         }
@@ -329,27 +422,141 @@ impl App {
         }
     }
 
-    pub fn set_scroll(&mut self, offset: usize, height: usize) {
-        self.list_offset = offset;
-        if self.selected >= offset + height {
-            self.selected = offset + height - 1;
-        }
-    }
-
-    /// Mouse click on a list row: `row` is 0-based within the visible viewport.
+    /// Mouse click on a visible row opens repositories and directories.
     pub fn click_list_row(&mut self, row: usize) {
-        let target = self.list_offset + row;
-        if target < self.filtered.len() {
-            self.select(target);
+        if self.browser.is_some() {
+            let target = self
+                .browser
+                .as_ref()
+                .and_then(|browser| browser.levels.last())
+                .map(|level| level.offset + row);
+            if let Some(target) = target {
+                self.select(target);
+                self.enter_browser_selection();
+            }
+        } else {
+            let target = self.list_offset + row;
+            if target < self.filtered.len() {
+                self.select(target);
+                self.open_browser_selected();
+            }
         }
     }
 
-    /// Double-click a list row: select it and open a shell in that folder.
-    pub fn double_click_list_row(&mut self, row: usize) {
-        let target = self.list_offset + row;
-        if target < self.filtered.len() {
-            self.select(target);
-            self.open_terminal();
+    pub fn open_browser_selected(&mut self) {
+        let Some(path) = self.selected_path() else {
+            return;
+        };
+        match read_directory(&path) {
+            Ok(entries) => {
+                self.browser = Some(DirectoryBrowser {
+                    levels: vec![DirectoryLevel {
+                        path,
+                        entries,
+                        selected: 0,
+                        offset: 0,
+                    }],
+                });
+                self.dirty = true;
+            }
+            Err(error) => {
+                self.message = error;
+                self.mode = AppMode::Message;
+                self.dirty = true;
+            }
+        }
+    }
+
+    pub fn enter_browser_selection(&mut self) {
+        let Some(entry) = self
+            .browser
+            .as_ref()
+            .and_then(|browser| browser.levels.last())
+            .and_then(|level| level.entries.get(level.selected))
+            .cloned()
+        else {
+            return;
+        };
+        if !entry.is_dir {
+            self.open_with_default_app(&entry.path);
+            return;
+        }
+        match read_directory(&entry.path) {
+            Ok(entries) => {
+                if let Some(browser) = &mut self.browser {
+                    browser.levels.push(DirectoryLevel {
+                        path: entry.path,
+                        entries,
+                        selected: 0,
+                        offset: 0,
+                    });
+                }
+                self.dirty = true;
+            }
+            Err(error) => {
+                self.message = error;
+                self.mode = AppMode::Message;
+                self.dirty = true;
+            }
+        }
+    }
+
+    pub fn go_back(&mut self) {
+        if let Some(browser) = &mut self.browser {
+            if browser.levels.len() > 1 {
+                browser.levels.pop();
+            } else {
+                self.browser = None;
+            }
+            self.dirty = true;
+        }
+    }
+
+    pub fn request_editor_selected(&mut self) {
+        let Some(path) = self.selected_path() else {
+            return;
+        };
+        self.pending_editor = Some(path);
+        self.mode = AppMode::EditorPrompt;
+        self.dirty = true;
+    }
+
+    fn open_with_default_app(&mut self, path: &Path) {
+        match launch_default_app(path) {
+            Ok(()) => {
+                self.status_line = format!("opened {} with the system default app", path.display());
+                self.refresh_terminal_after_external_app();
+            }
+            Err(error) => {
+                self.message = error;
+                self.mode = AppMode::Message;
+            }
+        }
+        self.dirty = true;
+    }
+
+    pub fn launch_pending_editor(&mut self, use_os_default: bool) {
+        let Some(path) = self.pending_editor.take() else {
+            self.mode = AppMode::Normal;
+            self.dirty = true;
+            return;
+        };
+
+        if use_os_default {
+            self.open_with_default_app(&path);
+        } else {
+            match launch_vscode(&path) {
+                Ok(()) => {
+                    self.status_line = format!("opened {} in editor", path.display());
+                    self.mode = AppMode::Normal;
+                    self.refresh_terminal_after_external_app();
+                }
+                Err(error) => {
+                    self.message = error;
+                    self.mode = AppMode::Message;
+                    self.dirty = true;
+                }
+            }
         }
     }
 
@@ -438,6 +645,62 @@ impl App {
     // Git operations (all async through spawned threads)
     // ------------------------------------------------------------------
 
+    pub fn request_delete_selected(&mut self) {
+        let Some(index) = self.filtered.get(self.selected).copied() else {
+            self.message = "no repository selected".into();
+            self.mode = AppMode::Message;
+            self.dirty = true;
+            return;
+        };
+        if self.repos[index].busy {
+            self.message = "repository is busy; wait for its current operation to finish".into();
+            self.mode = AppMode::Message;
+            self.dirty = true;
+            return;
+        }
+        self.pending_delete = Some(self.repos[index].path.clone());
+        self.mode = AppMode::ConfirmDelete;
+        self.dirty = true;
+    }
+
+    pub fn cancel_delete(&mut self) {
+        self.pending_delete = None;
+        self.mode = AppMode::Normal;
+        self.dirty = true;
+    }
+
+    pub fn confirm_delete(&mut self) {
+        let Some(path) = self.pending_delete.take() else {
+            self.mode = AppMode::Normal;
+            self.dirty = true;
+            return;
+        };
+        let Some(index) = self.repos.iter().position(|repo| repo.path == path) else {
+            self.message = "repository is no longer in the list".into();
+            self.mode = AppMode::Message;
+            self.dirty = true;
+            return;
+        };
+        if self.repos[index].busy {
+            self.message = "repository is busy; wait for its current operation to finish".into();
+            self.mode = AppMode::Message;
+            self.dirty = true;
+            return;
+        }
+
+        self.repos[index].busy = true;
+        let tx = self.tx.clone();
+        let delete_path = path.clone();
+        let status_path = delete_path.clone();
+        std::thread::spawn(move || {
+            let result = std::fs::remove_dir_all(&delete_path).map_err(|error| error.to_string());
+            let _ = tx.send(AppEvent::DeleteResult { path, result });
+        });
+        self.status_line = format!("deleting {}…", status_path.display());
+        self.mode = AppMode::Deleting;
+        self.dirty = true;
+    }
+
     fn run_op<F>(&mut self, name: &str, f: F)
     where
         F: FnOnce(PathBuf) -> Result<String, String> + Send + 'static,
@@ -525,10 +788,25 @@ impl App {
     }
 
     pub fn fetch_all(&mut self) {
-        let paths: Vec<PathBuf> = self.repos.iter().map(|r| r.path.clone()).collect();
+        let paths: Vec<PathBuf> = self
+            .repos
+            .iter_mut()
+            .filter_map(|repo| {
+                if repo.busy {
+                    None
+                } else {
+                    repo.busy = true;
+                    Some(repo.path.clone())
+                }
+            })
+            .collect();
         let total = paths.len();
         if total == 0 {
-            self.message = "no repositories to fetch".into();
+            self.message = if self.repos.is_empty() {
+                "no repositories to fetch".into()
+            } else {
+                "all repositories are busy".into()
+            };
             self.mode = AppMode::Message;
             self.dirty = true;
             return;
@@ -572,14 +850,30 @@ impl App {
         let _ = enable_raw_mode();
         let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen);
         self.dirty = true;
+        self.terminal_needs_clear = true;
         out
+    }
+
+    pub fn take_terminal_needs_clear(&mut self) -> bool {
+        std::mem::take(&mut self.terminal_needs_clear)
+    }
+
+    fn refresh_terminal_after_external_app(&mut self) {
+        self.terminal_needs_clear = true;
+        self.dirty = true;
     }
 
     pub fn open_terminal(&mut self) {
         let Some(path) = self.selected_path() else { return };
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| {
-            if cfg!(windows) { "cmd".into() } else { "bash".into() }
-        });
+        let shell = if cfg!(windows) {
+            if git::which("pwsh").is_some() {
+                "pwsh".into()
+            } else {
+                "powershell".into()
+            }
+        } else {
+            std::env::var("SHELL").unwrap_or_else(|_| "bash".into())
+        };
         self.with_terminal_restored(|| {
             eprintln!("spawning {shell} in {} — exit it to return", path.display());
             let _ = git::spawn_in_dir(&shell, &[], &path);
@@ -601,17 +895,17 @@ impl App {
 
     pub fn open_vscode(&mut self) {
         let Some(path) = self.selected_path() else { return };
-        let cmd = if git::which("code").is_some() {
-            "code"
-        } else if git::which("codium").is_some() {
-            "codium"
-        } else {
-            self.message = "VS Code (`code`) not found in PATH".into();
-            self.mode = AppMode::Message;
-            self.dirty = true;
-            return;
-        };
-        let _ = git::spawn_in_dir(cmd, &[&path.to_string_lossy()], &path);
+        match launch_vscode(&path) {
+            Ok(()) => {
+                self.status_line = format!("opened {} in editor", path.display());
+                self.refresh_terminal_after_external_app();
+            }
+            Err(error) => {
+                self.message = error;
+                self.mode = AppMode::Message;
+            }
+        }
+        self.dirty = true;
     }
 
     // ------------------------------------------------------------------
@@ -676,9 +970,199 @@ impl App {
         self.dirty = true;
     }
 
+    pub fn adjust_detail_width(&mut self, delta: i16, default_width: u16, area_width: u16) {
+        let current = self.detail_width.unwrap_or(default_width);
+        self.detail_width = Some(clamp_detail_width(
+            current.saturating_add_signed(delta),
+            area_width,
+        ));
+        self.dirty = true;
+    }
+
+    pub fn set_detail_width(&mut self, width: u16, area_width: u16) {
+        self.detail_width = Some(clamp_detail_width(width, area_width));
+        self.dirty = true;
+    }
+
     pub fn selected_entry(&self) -> Option<&RepoEntry> {
         self.filtered
             .get(self.selected)
             .and_then(|i| self.repos.get(*i))
+    }
+}
+
+fn clamp_detail_width(width: u16, area_width: u16) -> u16 {
+    let maximum = area_width.saturating_sub(24).max(1);
+    width.clamp(20.min(maximum), maximum)
+}
+
+fn read_directory(path: &Path) -> Result<Vec<DirectoryEntry>, String> {
+    let entries = std::fs::read_dir(path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    let mut result = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("could not read {}: {error}", path.display()))?;
+        if entry.file_name() == ".git" {
+            continue;
+        }
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("could not inspect {}: {error}", entry.path().display()))?;
+        result.push(DirectoryEntry {
+            path: entry.path(),
+            name: entry.file_name().to_string_lossy().into_owned(),
+            is_dir: file_type.is_dir(),
+        });
+    }
+    result.sort_by(|left, right| {
+        right
+            .is_dir
+            .cmp(&left.is_dir)
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(result)
+}
+
+fn launch_vscode(path: &Path) -> Result<(), String> {
+    let launcher = ["code", "codium"]
+        .into_iter()
+        .find_map(git::which)
+        .ok_or_else(|| "VS Code (`code`) or VSCodium (`codium`) not found in PATH".to_string())?;
+    #[cfg(windows)]
+    let executable = windows_editor_executable(&launcher)?;
+    #[cfg(not(windows))]
+    let executable = launcher;
+
+    Command::new(executable)
+        .arg(path)
+        .current_dir(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("could not launch VS Code: {error}"))
+}
+
+#[cfg(windows)]
+fn windows_editor_executable(launcher: &Path) -> Result<PathBuf, String> {
+    let extension = launcher
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default();
+    if !extension.eq_ignore_ascii_case("cmd") && !extension.eq_ignore_ascii_case("bat") {
+        return Ok(launcher.to_path_buf());
+    }
+
+    let app_dir = launcher
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| format!("could not locate the editor installation for {}", launcher.display()))?;
+    let launcher_name = launcher
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let app_names = if launcher_name.eq_ignore_ascii_case("codium") {
+        ["VSCodium.exe", "Codium.exe"]
+    } else {
+        ["Code.exe", "Code - Insiders.exe"]
+    };
+
+    app_names
+        .iter()
+        .map(|name| app_dir.join(name))
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| format!("could not find the editor executable beside {}", launcher.display()))
+}
+
+fn launch_default_app(path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = Command::new("explorer.exe");
+        command.arg(path);
+        command
+    };
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("open");
+        command.arg(path);
+        command
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = {
+        let mut command = Command::new("xdg-open");
+        command.arg(path);
+        command
+    };
+
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("could not open {} with the system default app: {error}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn browser_descends_and_returns_through_directory_levels() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("repo-hub-browser-{unique}"));
+        let nested = root.join("a-folder").join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::write(root.join("z-file.txt"), "").unwrap();
+        std::fs::write(nested.join("leaf.txt"), "").unwrap();
+
+        let mut app = App::new(false, Some(Vec::new()));
+        app.repos.push(RepoEntry {
+            path: root.clone(),
+            drive: 0,
+            info: None,
+            files: Vec::new(),
+            busy: false,
+        });
+        app.filtered.push(0);
+
+        app.click_list_row(0);
+        let root_level = app.browser.as_ref().unwrap().levels.last().unwrap();
+        assert_eq!(
+            root_level
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a-folder", "z-file.txt"]
+        );
+
+        app.click_list_row(0);
+        app.click_list_row(0);
+        assert_eq!(
+            app.browser.as_ref().unwrap().levels.last().unwrap().path,
+            nested
+        );
+
+        app.go_back();
+        assert_eq!(
+            app.browser.as_ref().unwrap().levels.last().unwrap().path,
+            root.join("a-folder")
+        );
+        app.go_back();
+        assert_eq!(
+            app.browser.as_ref().unwrap().levels.last().unwrap().path,
+            root
+        );
+        app.go_back();
+        assert!(app.browser.is_none());
+
+        app.request_editor_selected();
+        assert!(app.mode == AppMode::EditorPrompt);
+        assert_eq!(app.pending_editor.as_deref(), Some(root.as_path()));
+
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

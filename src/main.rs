@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use app::{App, AppMode};
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
-        KeyModifiers, MouseEventKind,
+        self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
+        Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -52,14 +52,24 @@ fn main() -> io::Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableFocusChange
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let res = run(&mut terminal, &mut app);
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        DisableFocusChange
+    )?;
     terminal.show_cursor()?;
 
     if let Err(e) = res {
@@ -70,8 +80,6 @@ fn main() -> io::Result<()> {
 
 /// Widget areas captured from the most recent render (for mouse hit-testing).
 static LAST_AREAS: Mutex<Option<ui::UiAreas>> = Mutex::new(None);
-/// Last list-row click, for double-click detection.
-static LAST_CLICK: Mutex<Option<(usize, Instant)>> = Mutex::new(None);
 
 fn last_areas() -> ui::UiAreas {
     LAST_AREAS.lock().map(|g| *g).unwrap_or(None).unwrap_or_default()
@@ -79,6 +87,31 @@ fn last_areas() -> ui::UiAreas {
 
 fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
     let areas = last_areas();
+    if mouse.kind == MouseEventKind::Up(crossterm::event::MouseButton::Left) {
+        app.dragging_divider = false;
+        return;
+    }
+
+    if app.dragging_divider
+        && matches!(
+            mouse.kind,
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left)
+        )
+    {
+        let left_width = mouse.column.saturating_sub(areas.main.x);
+        app.set_detail_width(
+            areas.main.width.saturating_sub(left_width),
+            areas.main.width,
+        );
+        return;
+    }
+
+    if matches!(
+        app.mode,
+        AppMode::ConfirmDelete | AppMode::Deleting | AppMode::EditorPrompt
+    ) {
+        return;
+    }
 
     // Wheel scrolling moves the selection through the repo list.
     match mouse.kind {
@@ -95,7 +128,19 @@ fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
         _ => {}
     }
 
-    if !matches!(mouse.kind, MouseEventKind::Down(crossterm::event::MouseButton::Left)) {
+    if !matches!(
+        mouse.kind,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left)
+    ) {
+        return;
+    }
+
+    if mouse.row >= areas.main.y
+        && mouse.row < areas.main.y + areas.main.height
+        && (mouse.column == areas.divider_x
+            || mouse.column.saturating_add(1) == areas.divider_x)
+    {
+        app.dragging_divider = true;
         return;
     }
 
@@ -108,21 +153,9 @@ fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
         }
     }
 
-    // 2. Repo list rows: single click selects, double click opens a shell there.
-    if let Some(row) = ui::list_row_at(areas.list, mouse.column, mouse.row) {
-        let now = Instant::now();
-        let is_double = LAST_CLICK
-            .lock()
-            .map(|g| g.map(|(r, t)| r == row && now.duration_since(t) < Duration::from_millis(400)).unwrap_or(false))
-            .unwrap_or(false);
-        if let Ok(mut g) = LAST_CLICK.lock() {
-            *g = if is_double { None } else { Some((row, now)) };
-        }
-        if is_double {
-            app.double_click_list_row(row);
-        } else {
-            app.click_list_row(row);
-        }
+    // 2. A repository click opens its directory; clicks on directories descend.
+    if let Some(row) = ui::list_row_at(areas.list, mouse.column, mouse.row, app.browser.is_some()) {
+        app.click_list_row(row);
         return;
     }
 
@@ -131,7 +164,10 @@ fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
         app.mode = AppMode::Normal;
         app.help = false;
         app.dirty = true;
-    } else if app.mode == AppMode::Prompt || app.mode == AppMode::Search {
+    } else if matches!(
+        app.mode,
+        AppMode::Prompt | AppMode::EditorPrompt | AppMode::Search
+    ) {
         app.mode = AppMode::Normal;
         app.dirty = true;
     }
@@ -150,6 +186,9 @@ fn run<B: ratatui::backend::Backend>(
 
         // Only redraw when something changed or the tick elapsed -> keeps CPU low.
         if app.dirty || last_render.elapsed() >= tick_rate {
+            if app.take_terminal_needs_clear() {
+                terminal.clear()?;
+            }
             let size: ratatui::layout::Rect = terminal.get_frame().area();
             let areas = ui::draw_areas(size, app);
             if let Ok(mut g) = LAST_AREAS.lock() {
@@ -169,6 +208,11 @@ fn run<B: ratatui::backend::Backend>(
                 }
                 Event::Mouse(m) => handle_mouse(app, m),
                 Event::Resize(_, _) => app.dirty = true,
+                Event::FocusGained => {
+                    terminal.autoresize()?;
+                    terminal.clear()?;
+                    app.dirty = true;
+                }
                 _ => {}
             }
         }
@@ -195,6 +239,9 @@ fn handle_key(app: &mut App, key: event::KeyEvent) {
         }
         AppMode::Search => search_keys(app, key),
         AppMode::Prompt => prompt_keys(app, key),
+        AppMode::EditorPrompt => editor_prompt_keys(app, key),
+        AppMode::ConfirmDelete => delete_confirm_keys(app, key),
+        AppMode::Deleting => {}
         AppMode::Normal => {
             if matches!(key.code, Char('q') | Char('Q')) && !ctrl {
                 app.should_quit = true;
@@ -208,6 +255,14 @@ fn handle_key(app: &mut App, key: event::KeyEvent) {
 fn normal_keys(app: &mut App, key: event::KeyEvent) {
     use KeyCode::*;
     match key.code {
+        Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let width = last_areas().main.width;
+            app.adjust_detail_width(4, ui::default_detail_width(width), width);
+        }
+        Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let width = last_areas().main.width;
+            app.adjust_detail_width(-4, ui::default_detail_width(width), width);
+        }
         Up | Char('k') => app.move_list(-1),
         Down | Char('j') => app.move_list(1),
         PageUp => app.move_list(-10),
@@ -235,6 +290,7 @@ fn normal_keys(app: &mut App, key: event::KeyEvent) {
         Char('F') => app.fetch_all(),
         Char('l') => app.pull(),
         Char('x') => app.clean_build(),
+        Delete => app.request_delete_selected(),
         Char('t') => app.open_terminal(),
         Char('g') => app.open_lazygit(),
         Char('v') => app.open_vscode(),
@@ -242,7 +298,50 @@ fn normal_keys(app: &mut App, key: event::KeyEvent) {
         Char('n') => app.toggle_dirty_filter(),
         Char('r') => app.rescan(),
         Char('?') | Char('H') => app.show_help(),
-        Enter => app.refresh_selected_now(),
+        Left => {
+            if app.help {
+                app.help = false;
+                app.dirty = true;
+            } else {
+                app.go_back();
+            }
+        }
+        Right => {
+            if app.browser.is_some() {
+                app.enter_browser_selection();
+            } else {
+                app.open_browser_selected();
+            }
+        }
+        Esc => {
+            if app.help {
+                app.help = false;
+                app.dirty = true;
+            } else {
+                app.go_back();
+            }
+        }
+        Enter => {
+            if app.browser.is_some() {
+                app.enter_browser_selection();
+            } else {
+                app.request_editor_selected();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn editor_prompt_keys(app: &mut App, key: event::KeyEvent) {
+    use KeyCode::*;
+    match key.code {
+        Char('v') | Char('V') => app.launch_pending_editor(false),
+        Char('d') | Char('D') => app.launch_pending_editor(true),
+        Esc => {
+            app.pending_editor = None;
+            app.mode = AppMode::Normal;
+            app.dirty = true;
+        }
         _ => {}
     }
 }
@@ -285,6 +384,15 @@ fn prompt_keys(app: &mut App, key: event::KeyEvent) {
             app.prompt_value.push(c);
             app.dirty = true;
         }
+        _ => {}
+    }
+}
+
+fn delete_confirm_keys(app: &mut App, key: event::KeyEvent) {
+    use KeyCode::*;
+    match key.code {
+        Esc => app.cancel_delete(),
+        Enter => app.confirm_delete(),
         _ => {}
     }
 }

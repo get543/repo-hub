@@ -1,5 +1,7 @@
 //! Ratatui rendering: drive tabs, repo list, detail pane, popups.
 
+use std::vec;
+
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -16,7 +18,35 @@ use crate::git;
 pub struct UiAreas {
     pub tabs: Rect,
     pub list: Rect,
-    pub detail: Rect,
+    pub main: Rect,
+    pub divider_x: u16,
+}
+
+fn draw_editor_prompt(f: &mut Frame, app: &App, area: Rect) {
+    let path = app
+        .pending_editor
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    let popup = centered_rect(70, 1, 8, area);
+    f.render_widget(Clear, popup);
+    let widget = Paragraph::new(vec![
+        Line::from("Open this repository with:"),
+        Line::from(""),
+        Line::from(path),
+        Line::from(""),
+        Line::from("V: VS Code / VSCodium"),
+        Line::from("D: system default application"),
+        Line::from("Esc: cancel"),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Open repository ")
+            .border_style(Style::default().fg(Color::Cyan)),
+    )
+    .wrap(Wrap { trim: false });
+    f.render_widget(widget, popup);
 }
 
 pub fn layout(size: Rect) -> [Rect; 5] {
@@ -35,8 +65,16 @@ pub fn layout(size: Rect) -> [Rect; 5] {
         .unwrap()
 }
 
-pub fn main_panes(area: Rect) -> [Rect; 2] {
-    let right_width = if area.width > 110 { 46 } else { 40 };
+pub fn default_detail_width(area_width: u16) -> u16 {
+    if area_width > 110 { 46 } else { 40 }
+}
+
+pub fn main_panes(area: Rect, detail_width: Option<u16>) -> [Rect; 2] {
+    let max_detail_width = area.width.saturating_sub(24).max(1);
+    let min_detail_width = 20.min(max_detail_width);
+    let right_width = detail_width
+        .unwrap_or_else(|| default_detail_width(area.width))
+        .clamp(min_detail_width, max_detail_width);
     Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Fill(1), Constraint::Length(right_width)])
@@ -44,6 +82,19 @@ pub fn main_panes(area: Rect) -> [Rect; 2] {
         .to_vec()
         .try_into()
         .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pane_layout_respects_requested_width_and_bounds() {
+        let area = Rect::new(0, 0, 120, 40);
+        assert_eq!(main_panes(area, Some(56))[1].width, 56);
+        assert_eq!(main_panes(area, Some(1))[1].width, 20);
+        assert_eq!(main_panes(area, Some(u16::MAX))[1].width, 96);
+    }
 }
 
 /// Accurate version: needs the tab titles, so pass them in.
@@ -67,7 +118,7 @@ pub fn tab_index_at(tabs: Rect, titles: &[String], col: u16) -> Option<usize> {
 }
 
 /// Row index within the visible list viewport for a given screen position.
-pub fn list_row_at(list: Rect, col: u16, row: u16) -> Option<usize> {
+pub fn list_row_at(list: Rect, col: u16, row: u16, single_line_rows: bool) -> Option<usize> {
     if list.height <= 2 || list.width == 0 {
         return None;
     }
@@ -81,25 +132,26 @@ pub fn list_row_at(list: Rect, col: u16, row: u16) -> Option<usize> {
     if row < inner_y || row >= inner_y + inner_h {
         return None;
     }
-    // Each repo occupies two visual rows.
-    Some(((row - inner_y) / 2) as usize)
+    let rows_per_item = if single_line_rows { 1 } else { 2 };
+    Some(((row - inner_y) / rows_per_item) as usize)
 }
 
 /// Compute the widget areas for a given terminal size (used for mouse hit-testing).
 pub fn draw_areas(size: Rect, _app: &App) -> UiAreas {
     let chunks = layout(size);
-    let panes = main_panes(chunks[1]);
+    let panes = main_panes(chunks[1], _app.detail_width);
     UiAreas {
         tabs: chunks[0],
         list: panes[0],
-        detail: panes[1],
+        main: chunks[1],
+        divider_x: panes[1].x,
     }
 }
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let size = f.area();
     let chunks = layout(size);
-    let panes = main_panes(chunks[1]);
+    let panes = main_panes(chunks[1], app.detail_width);
 
     draw_tabs(f, app, chunks[0]);
     draw_list(f, app, panes[0]);
@@ -114,6 +166,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     match app.mode {
         AppMode::Search => draw_search_bar(f, app, chunks[1]),
         AppMode::Prompt => draw_prompt(f, app, size),
+        AppMode::EditorPrompt => draw_editor_prompt(f, app, size),
+        AppMode::ConfirmDelete => draw_delete_confirmation(f, app, size),
+        AppMode::Deleting => draw_delete_progress(f, size),
         AppMode::Message => draw_message(f, app, size),
         _ => {}
     }
@@ -137,13 +192,18 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
         .style(Style::default().fg(Color::DarkGray))
         .highlight_style(
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Magenta)
                 .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
         );
     f.render_widget(tabs, area);
 }
 
 fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
+    if app.browser.is_some() {
+        draw_directory_list(f, app, area);
+        return;
+    }
+
     let scanning = app
         .scanner
         .as_ref()
@@ -165,7 +225,7 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
         }
     );
 
-    let height = area.height.saturating_sub(2).max(1) as usize;
+    let height = (area.height.saturating_sub(2) / 2).max(1) as usize;
 
     // Keep the selection inside the viewport by adjusting the offset.
     let mut offset = app.list_offset;
@@ -306,6 +366,70 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(list, area);
 }
 
+fn draw_directory_list(f: &mut Frame, app: &mut App, area: Rect) {
+    let Some(level) = app
+        .browser
+        .as_mut()
+        .and_then(|browser| browser.levels.last_mut())
+    else {
+        return;
+    };
+
+    let height = area.height.saturating_sub(2).max(1) as usize;
+    if level.selected >= level.offset + height {
+        level.offset = level.selected - height + 1;
+    }
+    if level.selected < level.offset {
+        level.offset = level.selected;
+    }
+
+    let visible: Vec<ListItem> = level
+        .entries
+        .iter()
+        .enumerate()
+        .skip(level.offset)
+        .take(height)
+        .map(|(index, entry)| {
+            let selected = index == level.selected;
+            let (glyph, color) = if entry.is_dir {
+                ("▸ ", Color::Cyan)
+            } else {
+                ("  ", Color::White)
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(glyph, Style::default().fg(color)),
+                Span::styled(
+                    entry.name.clone(),
+                    Style::default()
+                        .fg(color)
+                        .add_modifier(if selected { Modifier::BOLD } else { Modifier::empty() }),
+                ),
+            ]))
+            .style(Style::default().bg(if selected {
+                Color::Rgb(35, 45, 60)
+            } else {
+                Color::Reset
+            }))
+        })
+        .collect();
+
+    let title = format!(" Files — {} ", level.path.display());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .title_bottom(format!(
+            " showing {}-{} of {} ",
+            if level.entries.is_empty() {
+                0
+            } else {
+                level.offset + 1
+            },
+            (level.offset + visible.len()).min(level.entries.len()),
+            level.entries.len()
+        ));
+    f.render_widget(List::new(visible).block(block), area);
+}
+
 fn shorten_path(p: &std::path::Path) -> String {
     let s = p.display().to_string();
     if s.len() <= 60 {
@@ -316,13 +440,9 @@ fn shorten_path(p: &std::path::Path) -> String {
 
 fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
     let entry = app.selected_entry();
-    let path = entry
-        .map(|e| e.path.display().to_string())
-        .unwrap_or_else(|| "(no repository selected)".into());
-
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" {} ", shorten_path(std::path::Path::new(&path))))
+        .title(" Repository Details ")
         .title_alignment(ratatui::layout::Alignment::Center);
 
     let Some(entry) = entry else {
@@ -334,6 +454,12 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "Path:",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(entry.path.display().to_string()));
+    lines.push(Line::from(""));
 
     match &entry.info {
         None => lines.push(Line::from(Span::styled(
@@ -498,9 +624,17 @@ fn draw_legend(f: &mut Frame, area: Rect) {
 
 fn draw_hints(f: &mut Frame, app: &App, area: Rect) {
     let txt = match app.mode {
-        AppMode::Normal => " 🖱 click=select · dbl-click=shell · wheel=scroll · Tab=drive  |  ⌨ j/k move · / search · a stage · c commit · p push · f fetch · F fetch-all · n dirty-only · t/g/v tools · x clean · ? help · q quit ",
+        AppMode::Normal if app.browser.is_some() => {
+            " ←/Esc back · ↑/↓ move · →/click folder open · Enter/click file open · Ctrl+←/→ resize "
+        }
+        AppMode::Normal => {
+            " click/→ browse · Enter editor choices · Ctrl+←/→ resize · drag divider · j/k move · / search · ? help · q quit "
+        }
         AppMode::Search => " 🔎 type to filter repos · Enter apply · Esc clear ",
         AppMode::Prompt => " ✏️  Enter = run commit · Esc = cancel ",
+        AppMode::EditorPrompt => " V = VS Code · D = OS default app · Esc = cancel ",
+        AppMode::ConfirmDelete => " Delete repository folder? Enter = permanently delete · Esc = cancel ",
+        AppMode::Deleting => " Deleting repository folder… ",
         AppMode::Message => " press any key / click to dismiss ",
     };
     f.render_widget(
@@ -558,6 +692,45 @@ fn draw_prompt(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(widget, popup);
 }
 
+fn draw_delete_confirmation(f: &mut Frame, app: &App, area: Rect) {
+    let path = app
+        .pending_delete
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    let popup = centered_rect(80, 1, 10, area);
+    f.render_widget(Clear, popup);
+    let widget = Paragraph::new(vec![
+        Line::from("Permanently delete this repository folder?"),
+        Line::from(""),
+        Line::from(path),
+        Line::from(""),
+        Line::from("Enter: delete permanently    Esc: cancel"),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Confirm repository deletion ")
+            .border_style(Style::default().fg(Color::LightRed)),
+    )
+    .wrap(Wrap { trim: false });
+    f.render_widget(widget, popup);
+}
+
+fn draw_delete_progress(f: &mut Frame, area: Rect) {
+    let popup = centered_rect(60, 1, 5, area);
+    f.render_widget(Clear, popup);
+    let widget = Paragraph::new("Deleting repository folder…")
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Please wait ")
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(widget, popup);
+}
+
 fn draw_message(f: &mut Frame, app: &App, area: Rect) {
     let h = app.message.lines().count().max(1) as u16 + 3;
     let popup = centered_rect(70, 1, h.min(14), area);
@@ -595,16 +768,21 @@ fn draw_help(f: &mut Frame, area: Rect) {
 
     let rows = vec![
         section("🖱  Mouse", Color::Green),
-        kv("click a row", "select that repository (detail pane updates instantly)"),
-        kv("double-click a row", "open a shell inside that repo — type `exit` to return"),
+        kv("click a repository", "browse its files and folders"),
+        kv("click a folder / →", "open that folder"),
+        kv("click a file / Enter", "open it with the system default app"),
         kv("scroll wheel", "move through the repo list (3 rows per notch)"),
         kv("click a drive tab", "filter the list to that drive, or \"All\""),
         kv("click outside popup", "dismiss help / result / search / prompt"),
         section("⌨  Keys", Color::Cyan),
         kv("j / k / ↑ / ↓", "move selection through the repository list"),
+        kv("Ctrl+← / Ctrl+→", "grow / shrink the detail pane"),
+        kv("drag pane divider", "resize the repository list and detail pane"),
+        kv("→ / ←", "open selected repo/folder  ·  go back one level"),
+        kv("Esc", "go back one level or dismiss the current prompt"),
         kv("Tab / Shift-Tab", "cycle drive tabs (All → drive1 → drive2 …)"),
         kv("/", "live search over repo names & full paths (Enter keeps, Esc clears)"),
-        kv("Enter", "re-read the selected repo's git status right now"),
+        kv("Enter on repository", "choose an editor for the selected repository"),
         kv("n", "end-of-day audit: show only dirty / unpushed repos"),
         kv("a  ·  u", "stage everything (git add -A)  ·  unstage everything"),
         kv("c", "commit staged changes (prompts for a message; Enter runs it)"),
@@ -612,7 +790,9 @@ fn draw_help(f: &mut Frame, area: Rect) {
         kv("l", "pull --ff-only"),
         kv("f / F", "fetch this repo  ·  fetch ALL repos in the background"),
         kv("t / g / v", "open shell / lazygit / VS Code at the repo"),
+        kv("V / D", "choose VS Code / system default app in the editor prompt"),
         kv("x", "delete target/node_modules/dist/build to reclaim disk space"),
+        kv("Delete", "permanently delete the selected repo folder after confirmation"),
         kv("e", "export a TSV report of every repo to the temp folder"),
         kv("r", "rescan all drives from scratch (clears the cache)"),
         kv("?  ·  q", "toggle this help  ·  quit (Ctrl-C also works)"),
