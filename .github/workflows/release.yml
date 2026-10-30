@@ -55,13 +55,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p AppDir/usr/bin AppDir/usr/share/applications release
+          mkdir -p \
+            AppDir/usr/bin \
+            AppDir/usr/share/applications \
+            AppDir/usr/share/icons/hicolor/256x256/apps \
+            release
           cp target/release/repo-hub AppDir/usr/bin/repo-hub
+          cp assets/repo-hub.png \
+            AppDir/usr/share/icons/hicolor/256x256/apps/repo-hub.png
           cat > AppDir/usr/share/applications/repo-hub.desktop <<'EOF'
           [Desktop Entry]
           Name=Repo Hub
           Comment=Discover and manage Git repositories
           Exec=repo-hub
+          Icon=repo-hub
           Type=Application
           Categories=Development;
           Terminal=true

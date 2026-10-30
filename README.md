@@ -31,13 +31,13 @@ The first scan can take some time because the application searches the selected 
 Clone the repository with Git:
 
 ```bash
-git clone https://github.com/udin-agent/github-detector-ratatui.git
-cd github-detector-ratatui
+git clone https://github.com/get543/repo-hub.git
+cd repo-hub
 ```
 
 Or download the source as a ZIP from the repository's GitHub page:
 
-<https://github.com/udin-agent/github-detector-ratatui>
+<https://github.com/get543/repo-hub>
 
 This project currently documents building from source. If prebuilt binaries are published later, they should be downloaded from the repository's **Releases** page rather than from the source archive.
 
@@ -77,13 +77,13 @@ repo-hub
 
 By default, repo-hub uses its cache and scans the drives detected by the operating system.
 
-```text
+```bash
 repo-hub --no-cache
 ```
 
 Ignore the saved cache and perform a fresh scan while starting:
 
-```text
+```bash
 repo-hub --cache
 ```
 
@@ -91,13 +91,13 @@ Explicitly enable the cache. This is the default behavior.
 
 Limit the scan to one or more existing folders. Separate multiple paths with commas:
 
-```text
+```pwsh
 repo-hub --roots C:\Users\you\src,D:\projects
 ```
 
 On Linux or macOS:
 
-```text
+```bash
 repo-hub --roots ~/src,~/projects
 ```
 
