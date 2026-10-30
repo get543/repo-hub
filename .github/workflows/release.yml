@@ -2,16 +2,75 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
-  workflow_dispatch:
+    branches:
+      - main
+
+concurrency:
+  group: automatic-release
+  cancel-in-progress: false
 
 permissions:
   contents: write
 
 jobs:
+  prepare:
+    name: Create release tag and changelog
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release_info.outputs.tag }}
+      changelog: ${{ steps.release_info.outputs.changelog }}
+
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create release tag and collect commit messages
+        id: release_info
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          package_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [[ -z "$package_version" ]]; then
+            echo "Could not read package version from Cargo.toml"
+            exit 1
+          fi
+          release_tag="v${package_version}"
+
+          if git show-ref --tags --verify --quiet "refs/tags/$release_tag"; then
+            echo "Release tag $release_tag already exists. Bump the version in Cargo.toml before pushing."
+            exit 1
+          fi
+
+          previous_tag="$(git tag --list 'v*' --sort=-v:refname | head -n 1)"
+
+          if [[ -n "$previous_tag" ]]; then
+            commits="$(git log --pretty=format:'- %s (%h)' "${previous_tag}..HEAD")"
+          else
+            commits="$(git log --pretty=format:'- %s (%h)' HEAD)"
+          fi
+
+          if [[ -z "$commits" ]]; then
+            commits="- Automated release for commit ${GITHUB_SHA::7}"
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$release_tag" "$GITHUB_SHA" -m "Release $release_tag"
+          git push origin "$release_tag"
+
+          {
+            echo "tag=$release_tag"
+            echo 'changelog<<CHANGELOG_EOF'
+            echo "$commits"
+            echo 'CHANGELOG_EOF'
+          } >> "$GITHUB_OUTPUT"
+
   build:
     name: Build ${{ matrix.name }}
+    needs: prepare
     strategy:
       fail-fast: false
       matrix:
@@ -31,6 +90,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
 
       - name: Install Linux packaging dependencies
         if: matrix.platform == 'linux'
@@ -119,8 +180,7 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: build
+    needs: [prepare, build]
     runs-on: ubuntu-latest
 
     steps:
@@ -132,8 +192,10 @@ jobs:
           path: release
 
       - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: Release ${{ needs.prepare.outputs.tag }}
+          body: ${{ needs.prepare.outputs.changelog }}
+          target_commitish: ${{ github.sha }}
           files: release/*
