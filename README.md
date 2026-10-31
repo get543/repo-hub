@@ -118,12 +118,13 @@ When repo-hub starts, it begins scanning immediately. Repositories appear in the
 | `Right Arrow` | Browse the selected repository, or open a selected folder |
 | `Left Arrow` / `Escape` | Go back one directory level; Escape dismisses prompts |
 | `Ctrl` + `Left` / `Right` | Grow / shrink the detail pane |
+| `Ctrl` + `Up` / `Down` | Scroll the selected repository's detail pane |
 | `n` | Toggle the dirty/unpushed-only filter |
 | `r` | Clear the cache and rescan all roots from scratch |
 | `?` or `H` | Open the built-in help screen |
 | `q` or `Ctrl-C` | Quit |
 
-Mouse input is also supported. Drag the divider between the repository list and detail pane to resize them. Click a repository row to browse its files and folders; click a folder to open it, or click a file to open it with your operating system's default application. In the browser, select a file and press `Enter` to open it as well. Use the wheel to scroll or click a drive tab to filter by drive. The browser includes hidden files but omits Git's internal `.git` directory.
+Mouse input is also supported. Drag the divider between the repository list and detail pane to resize them. The mouse wheel scrolls the pane beneath the pointer; `Ctrl` + `Up` / `Down` scrolls the repository details without changing the selected repository. Click a repository row to browse its files and folders; click a folder to open it, or click a file to open it with your operating system's default application. In the browser, select a file and press `Enter` to open it as well. Click a drive tab to filter by drive. The browser includes hidden files but omits Git's internal `.git` directory.
 
 ### Git operations
 

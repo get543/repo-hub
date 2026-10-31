@@ -18,6 +18,7 @@ use crate::git;
 pub struct UiAreas {
     pub tabs: Rect,
     pub list: Rect,
+    pub detail: Rect,
     pub main: Rect,
     pub divider_x: u16,
 }
@@ -87,6 +88,7 @@ pub fn main_panes(area: Rect, detail_width: Option<u16>) -> [Rect; 2] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::text::Span;
 
     #[test]
     fn pane_layout_respects_requested_width_and_bounds() {
@@ -94,6 +96,17 @@ mod tests {
         assert_eq!(main_panes(area, Some(56))[1].width, 56);
         assert_eq!(main_panes(area, Some(1))[1].width, 20);
         assert_eq!(main_panes(area, Some(u16::MAX))[1].width, 96);
+    }
+
+    #[test]
+    fn wrapped_line_count_accounts_for_long_lines_and_empty_lines() {
+        let lines = vec![
+            Line::from(""),
+            Line::from(Span::raw("123456789")),
+            Line::from("short"),
+        ];
+        assert_eq!(wrapped_line_count(&lines, 5), 4);
+        assert_eq!(wrapped_line_count(&lines, 0), 0);
     }
 }
 
@@ -143,6 +156,7 @@ pub fn draw_areas(size: Rect, _app: &App) -> UiAreas {
     UiAreas {
         tabs: chunks[0],
         list: panes[0],
+        detail: panes[1],
         main: chunks[1],
         divider_x: panes[1].x,
     }
@@ -438,7 +452,7 @@ fn shorten_path(p: &std::path::Path) -> String {
     format!("…{}", &s[s.len() - 59..])
 }
 
-fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
+fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
     let entry = app.selected_entry();
     let block = Block::default()
         .borders(Borders::ALL)
@@ -516,7 +530,7 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(Color::Green),
                 )));
             } else {
-                for fe in entry.files.iter().take(200) {
+                for fe in &entry.files {
                     let color = match fe.code.as_str() {
                         c if c.contains('?') => Color::DarkGray,
                         c if c.starts_with('A') || c.starts_with('R') => Color::Green,
@@ -528,20 +542,42 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
                         Span::raw(fe.path.clone()),
                     ]));
                 }
-                if entry.files.len() > 200 {
-                    lines.push(Line::from(format!(
-                        "  … and {} more",
-                        entry.files.len() - 200
-                    )));
-                }
             }
         }
     }
 
+    let inner = block.inner(area);
+    let content_rows = wrapped_line_count(&lines, inner.width);
+    let viewport_rows = inner.height as usize;
+    let max_scroll = content_rows.saturating_sub(viewport_rows);
+    app.detail_scroll = usize::from(app.detail_scroll)
+        .min(max_scroll)
+        .min(u16::MAX as usize) as u16;
+    let scroll = app.detail_scroll;
+    let position = usize::from(scroll);
+    let end = (position + viewport_rows).min(content_rows);
+    let bottom_title = if max_scroll > 0 {
+        format!(" {}-{} / {} lines · Ctrl+↑/↓ or wheel ", position + 1, end, content_rows)
+    } else {
+        format!(" {} lines ", content_rows)
+    };
+    let block = block.title_bottom(bottom_title);
+
     let para = Paragraph::new(lines)
         .block(block)
-        .wrap(Wrap { trim: false });
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
     f.render_widget(para, area);
+}
+
+fn wrapped_line_count(lines: &[Line<'_>], width: u16) -> usize {
+    if width == 0 {
+        return 0;
+    }
+    lines
+        .iter()
+        .map(|line| line.width().max(1).div_ceil(usize::from(width)))
+        .sum()
 }
 
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
@@ -625,10 +661,10 @@ fn draw_legend(f: &mut Frame, area: Rect) {
 fn draw_hints(f: &mut Frame, app: &App, area: Rect) {
     let txt = match app.mode {
         AppMode::Normal if app.browser.is_some() => {
-            " ←/Esc back · ↑/↓ move · →/click folder open · Enter/click file open · Ctrl+←/→ resize "
+            " ←/Esc back · ↑/↓ move · →/click folder open · Enter/click file open · Ctrl+↑/↓ details "
         }
         AppMode::Normal => {
-            " click/→ browse · Enter editor choices · Ctrl+←/→ resize · drag divider · j/k move · / search · ? help · q quit "
+            " click/→ browse · Enter editor choices · Ctrl+←/→ resize · Ctrl+↑/↓ details · wheel over pane scrolls · j/k move · ? help · q quit "
         }
         AppMode::Search => " 🔎 type to filter repos · Enter apply · Esc clear ",
         AppMode::Prompt => " ✏️  Enter = run commit · Esc = cancel ",
@@ -777,6 +813,8 @@ fn draw_help(f: &mut Frame, area: Rect) {
         section("⌨  Keys", Color::Cyan),
         kv("j / k / ↑ / ↓", "move selection through the repository list"),
         kv("Ctrl+← / Ctrl+→", "grow / shrink the detail pane"),
+        kv("Ctrl+↑ / Ctrl+↓", "scroll the repository details"),
+        kv("mouse wheel", "scroll the pane under the pointer"),
         kv("drag pane divider", "resize the repository list and detail pane"),
         kv("→ / ←", "open selected repo/folder  ·  go back one level"),
         kv("Esc", "go back one level or dismiss the current prompt"),

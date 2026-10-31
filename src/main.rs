@@ -113,16 +113,30 @@ fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) {
         return;
     }
 
-    // Wheel scrolling moves the selection through the repo list.
+    // The wheel scrolls whichever main pane is under the pointer.
     match mouse.kind {
         MouseEventKind::ScrollUp => {
-            app.move_list(-3);
-            app.dirty = true;
+            let position = ratatui::layout::Position {
+                x: mouse.column,
+                y: mouse.row,
+            };
+            if areas.detail.contains(position) {
+                app.scroll_detail(-3);
+            } else if areas.list.contains(position) {
+                app.move_list(-3);
+            }
             return;
         }
         MouseEventKind::ScrollDown => {
-            app.move_list(3);
-            app.dirty = true;
+            let position = ratatui::layout::Position {
+                x: mouse.column,
+                y: mouse.row,
+            };
+            if areas.detail.contains(position) {
+                app.scroll_detail(3);
+            } else if areas.list.contains(position) {
+                app.move_list(3);
+            }
             return;
         }
         _ => {}
@@ -263,6 +277,8 @@ fn normal_keys(app: &mut App, key: event::KeyEvent) {
             let width = last_areas().main.width;
             app.adjust_detail_width(-4, ui::default_detail_width(width), width);
         }
+        Up if key.modifiers.contains(KeyModifiers::CONTROL) => app.scroll_detail(-3),
+        Down if key.modifiers.contains(KeyModifiers::CONTROL) => app.scroll_detail(3),
         Up | Char('k') => app.move_list(-1),
         Down | Char('j') => app.move_list(1),
         PageUp => app.move_list(-10),

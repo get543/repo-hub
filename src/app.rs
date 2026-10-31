@@ -84,6 +84,7 @@ pub struct App {
     pub list_offset: usize,   // scroll offset
     pub browser: Option<DirectoryBrowser>,
     pub detail_width: Option<u16>,
+    pub detail_scroll: u16,
     pub dragging_divider: bool,
 
     pub search_query: String,
@@ -135,6 +136,7 @@ impl App {
             list_offset: 0,
             browser: None,
             detail_width: None,
+            detail_scroll: 0,
             dragging_divider: false,
             search_query: String::new(),
             dirty_only: false,
@@ -387,7 +389,11 @@ impl App {
         if ns >= len {
             ns = len - 1;
         }
-        self.selected = ns as usize;
+        let next = ns as usize;
+        if next != self.selected {
+            self.detail_scroll = 0;
+        }
+        self.selected = next;
         self.clamp_scroll();
         self.refresh_selected_now();
         self.dirty = true;
@@ -409,7 +415,11 @@ impl App {
         if self.filtered.is_empty() {
             return;
         }
-        self.selected = i.min(self.filtered.len() - 1);
+        let next = i.min(self.filtered.len() - 1);
+        if next != self.selected {
+            self.detail_scroll = 0;
+        }
+        self.selected = next;
         self.clamp_scroll();
         self.refresh_selected_now();
         self.dirty = true;
@@ -567,6 +577,7 @@ impl App {
         }
         self.apply_filter();
         self.selected = 0;
+        self.detail_scroll = 0;
         self.list_offset = 0;
         self.refresh_selected_now();
         self.dirty = true;
@@ -590,6 +601,7 @@ impl App {
         };
         self.apply_filter();
         self.selected = 0;
+        self.detail_scroll = 0;
         self.list_offset = 0;
         self.refresh_selected_now();
         self.dirty = true;
@@ -599,10 +611,12 @@ impl App {
         self.dirty_only = !self.dirty_only;
         self.apply_filter();
         self.selected = 0;
+        self.detail_scroll = 0;
         self.dirty = true;
     }
 
     pub fn apply_filter(&mut self) {
+        let previous_path = self.selected_path();
         let q = self.search_query.to_lowercase();
         self.filtered = self
             .repos
@@ -637,6 +651,9 @@ impl App {
             .collect();
         if self.selected >= self.filtered.len() {
             self.selected = self.filtered.len().saturating_sub(1);
+        }
+        if self.selected_path() != previous_path {
+            self.detail_scroll = 0;
         }
         self.dirty = true;
     }
@@ -981,6 +998,11 @@ impl App {
 
     pub fn set_detail_width(&mut self, width: u16, area_width: u16) {
         self.detail_width = Some(clamp_detail_width(width, area_width));
+        self.dirty = true;
+    }
+
+    pub fn scroll_detail(&mut self, delta: i16) {
+        self.detail_scroll = self.detail_scroll.saturating_add_signed(delta);
         self.dirty = true;
     }
 
