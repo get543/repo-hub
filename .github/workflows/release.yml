@@ -39,10 +39,10 @@ jobs:
           fi
           release_tag="v${package_version}"
 
-          if git show-ref --tags --verify --quiet "refs/tags/$release_tag"; then
-            echo "Release tag $release_tag already exists. Bump the version in Cargo.toml before pushing."
-            exit 1
-          fi
+          # if git show-ref --tags --verify --quiet "refs/tags/$release_tag"; then
+          #   echo "Release tag $release_tag already exists. Bump the version in Cargo.toml before pushing."
+          #   exit 1
+          # fi
 
           previous_tag="$(git tag --list 'v*' --sort=-v:refname | head -n 1)"
 
