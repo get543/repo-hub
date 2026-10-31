@@ -39,11 +39,6 @@ jobs:
           fi
           release_tag="v${package_version}"
 
-          # if git show-ref --tags --verify --quiet "refs/tags/$release_tag"; then
-          #   echo "Release tag $release_tag already exists. Bump the version in Cargo.toml before pushing."
-          #   exit 1
-          # fi
-
           previous_tag="$(git tag --list 'v*' --sort=-v:refname | head -n 1)"
 
           if [[ -n "$previous_tag" ]]; then
@@ -58,8 +53,8 @@ jobs:
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "$release_tag" "$GITHUB_SHA" -m "Release $release_tag"
-          git push origin "$release_tag"
+          git tag -fa "$release_tag" "$GITHUB_SHA" -m "Release $release_tag"
+          git push --force origin "$release_tag"
 
           {
             echo "tag=$release_tag"
@@ -136,4 +131,5 @@ jobs:
           tag_name: ${{ needs.prepare.outputs.tag }}
           name: Release ${{ needs.prepare.outputs.tag }}
           body: ${{ needs.prepare.outputs.changelog }}
+          overwrite_files: true
           files: release/*
